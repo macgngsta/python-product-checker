@@ -1,4 +1,5 @@
 import time
+import urllib.parse
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support import expected_conditions as EC
@@ -15,6 +16,10 @@ from checker.common.session_object import SessionObject
 from checker.common.twilio_notifier import TwilioNotifier
 
 from dotenv import load_dotenv
+
+from checker.exception.login_exception import LoginExpiredException
+from checker.exception.token_exception import TokenExpiredException
+
 load_dotenv()
 
 class KaiserNorCal:
@@ -41,23 +46,25 @@ class KaiserNorCal:
 
         #build the session here
         if not self.session.is_active():
-            logger.info('building session...')
-            if self.do_login():
-                facilities_json = self.get_facilities()
+            #if login is expired, we should probbaly build both
+            if not self.session.is_login_active():
+                logger.info('building full session...')
+                if self.do_login(True):
+                    self.get_facilities()
+                else:
+                    logger.warning('unable to build login')
+            if not self.session.is_token_active():
+                logger.info('refreshing token...')
+                self.get_facilities()
 
         #start processing - at this point we hopefully have a valid session
-        logger.info('active session, making requests...')
-        for facility in self.facilities:
-            status = self.check_slots_by_facility(facility)
-            if status ==1:
-                TwilioNotifier.send_notification(f"found vaccine slot at {facility}")
-
-            report.add_facility(facility, status)
-
-        #build session
-        #run code
-        #if
-
+        if self.session.is_active():
+            logger.info('making requests...')
+            for facility in self.facilities:
+                status = self.check_slots_by_facility(facility)
+                report.add_facility(facility, status)
+        else:
+            logger.warning('session was not active, something happened')
 
         end = time.perf_counter()
 
@@ -72,8 +79,13 @@ class KaiserNorCal:
         logger.debug('checking for slots in facility '+ facility_code)
         #hit facility
         status = self.request_slots(facility_code)
-        #delete the appointment
-        self.delete_appointment()
+
+        #if there is a slot - open browser, force cookies
+        if status==1:
+            self.get_appointment()
+        else:
+            #delete the appointment
+            self.delete_appointment()
 
         return status
 
@@ -81,17 +93,17 @@ class KaiserNorCal:
     ## HELPER METHODS
     ##-------------------------------
 
-    def do_login(self):
+    def do_login(self, is_headless):
         login_u = os.getenv('KAISER_LOGIN')
         login_p = os.getenv('KAISER_PASSWORD')
         browser_path = os.getenv('PATH_TO_FIREFOX_DRIVER')
 
         #set the time when i rebuild this
         self.created_at=time.time()
-        self.session.login = login_u
+        self.session.set_login(login_u)
 
         opts = Options()
-        opts.headless = True
+        opts.headless = is_headless
         browser = Firefox(options=opts, executable_path=browser_path)
         browser.get(self.LOGIN_REQUEST)
 
@@ -112,15 +124,11 @@ class KaiserNorCal:
             logger.warning('Loading took too long...')
             return False
 
-        cookie_list = []
-        for cookie in browser.get_cookies():
-            cookie_list.append(f"{cookie['name']}={cookie['value']}")
-        cookie_str = '; '.join(cookie_list)
+        self.session.set_cookies_raw(browser.get_cookies())
+        logger.debug(f"COOKIE: {self.session.cookies}")
 
-        self.session.cookies = cookie_str
-        logger.debug(f"COOKIE: {cookie_str}")
-
-        browser.close()
+        if is_headless:
+            browser.close()
 
         #TODO: need to create a condition where the login doesnt work
 
@@ -137,7 +145,9 @@ class KaiserNorCal:
             response = requests.get(self.FACILITIES_REQUEST, headers=headers)
             response.raise_for_status()
         except requests.exceptions.HTTPError as errh:
-            logger.error("Http Error:", errh)
+            logger.debug("Http Error:", errh)
+            #most likely login is out of date
+            raise LoginExpiredException(errh)
         except requests.exceptions.ConnectionError as errc:
             logger.error("Error Connecting:", errc)
         except requests.exceptions.Timeout as errt:
@@ -151,8 +161,7 @@ class KaiserNorCal:
                 if 'token' in t:
                     token = t['token']
                     logger.debug(f"TOKEN: {token}")
-                    self.session.token = token
-                    self.is_good = True
+                    self.session.set_token(token)
 
                 return t
             else:
@@ -166,10 +175,13 @@ class KaiserNorCal:
     def request_slots(self, facility):
         logger.debug('requesting slots for '+ facility)
 
+        sd = time.strftime('%d/%m/%Y')
+        sd_str = urllib.parse.quote_plus(sd)
+
         params = {}
         params['tokenIdQuery'] = self.session.token
         params['showFirstAvailable'] = 'true'
-        params['startDate'] = '01%2F20%2F2021'
+        params['startDate'] = sd_str
         params['bookingGuideline'] = 'COVIDVACCINE'
 
         uri = f"{self.SLOT_REQUEST}/{facility}/slot-locks"
@@ -179,7 +191,9 @@ class KaiserNorCal:
             response = requests.post(uri, headers=headers, params=params)
             response.raise_for_status()
         except requests.exceptions.HTTPError as errh:
-            logger.error("Http Error:", errh)
+            logger.debug("Http Error:", errh)
+            # most likely login is out of date
+            raise TokenExpiredException(errh)
         except requests.exceptions.ConnectionError as errc:
             logger.error("Error Connecting:", errc)
         except requests.exceptions.Timeout as errt:
@@ -193,8 +207,16 @@ class KaiserNorCal:
                     logger.info(f"No slots available at: {facility}")
                     return 0
                 else:
+                    logger.info(t)
+
+                    appointmentList = []
+                    for sl in t['slots']:
+                        appt = f"* {sl['facilityName']} at {sl['appointmentDate']} {sl['appointmentTime']}"
+                        appointmentList.append(appt)
+
                     logger.info(f"SLOTS AVAILABLE: {facility}")
-                    return 1
+                    TwilioNotifier.send_notification(f"Vaccine slot(s) at {facility} - {'|'.join(appointmentList)}")
+                    return len(appointmentList)
 
         logger.warning(f"Response for slots at {facility} was empty")
         return -1
@@ -219,3 +241,9 @@ class KaiserNorCal:
             logger.error("Timeout Error:", errt)
         except requests.exceptions.RequestException as err:
             logger.error("Oops: Something Else", err)
+
+    ##-------------------------------
+
+    def get_appointment(self):
+        self.do_login(False)
+        self.delete_appointment()

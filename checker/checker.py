@@ -2,6 +2,7 @@
 # STRATEGY:
 # login, get token, check for slots available
 # -------------------------------
+import random
 import sched
 import time
 
@@ -22,14 +23,17 @@ class Checker:
     def execute(self):
         counter = 1
         self.run_tasks()
+        self.send_report()
         self.scheduler.run()
 
     ##-------------------------------
 
     def run_tasks(self):
+        #random interval between 5 min and 7 minutes
+        interval = random.randint(300, 420)
         # seconds delay 300
         # schedule the next one?
-        e1 = self.scheduler.enter(300, 1, self.run_tasks)
+        e1 = self.scheduler.enter(interval, 1, self.run_tasks)
 
         logger.info(f"{time.strftime('%Y-%m-%d %H:%M:%S')} running...")
         for strategy in self.strategies:
@@ -39,6 +43,7 @@ class Checker:
     ##-------------------------------
 
     def send_report(self):
+
         #every 1 hr, send a report
         e2 = self.scheduler.enter(3600, 1, self.send_report)
 

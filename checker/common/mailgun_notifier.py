@@ -1,6 +1,7 @@
 import os
-
 import requests
+
+from checker.common.setup_logger import logger
 
 class MailgunNotifier:
     @staticmethod
@@ -13,16 +14,13 @@ class MailgunNotifier:
 
         to_array = []
         if ',' in mailgun_to:
-            for to_recip in mailgun_to.split():
-                quoted = '"'+to_recip+'"'
-                to_array.append(quoted)
+            to_array = mailgun_to.split(',')
         else:
-            quoted = '"' + mailgun_to + '"'
-            to_array.append(quoted)
+            to_array.append(mailgun_to)
 
-        return requests.post(mailgun_url, auth=("api",mailgun_apikey), data={
+        return requests.post(mailgun_url+"/messages", auth=("api",mailgun_apikey), data={
             "from": mailgun_from,
-            "to":[','.join(to_array)],
+            "to":to_array,
             "subject": subject,
             "text":message
         })
